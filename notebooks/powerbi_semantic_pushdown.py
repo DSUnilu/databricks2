@@ -700,32 +700,56 @@ class DAXTranslator:
         return sql, "success"
 
     def _translate_algebra(self, expr: str, produced_sql: Dict[str, str]) -> Tuple[str, str]:
-        """Translate arithmetic expressions combining measures"""
-        expr = expr.strip()
-        refs = set(_measure_refs(expr))
+        """Translate arithmetic expressions combining previously translated measures."""
+        expr_clean = expr.strip()
+        refs = _measure_refs(expr_clean)
         if not refs:
             return None, "not_applicable"
 
-        # Check all referenced measures are available
-        for r in refs:
-            if r not in produced_sql:
+        # Ensure every referenced measure has been translated
+        ordered_refs: List[str] = []
+        seen_refs = set()
+        for ref in refs:
+            if ref not in produced_sql:
                 return None, "manual_required"
+            if ref not in seen_refs:
+                ordered_refs.append(ref)
+                seen_refs.add(ref)
 
-        # Replace measure refs with SQL subqueries
-        rep = expr
-        for r in refs:
-            rep = rep.replace(f"[{r}]", f"({produced_sql[r]})")
+        # Replace references with placeholders for validation
+        placeholder_expr = expr_clean
+        for idx, ref in enumerate(ordered_refs):
+            placeholder = f"__M{idx}__"
+            placeholder_expr = re.sub(
+                rf'\[{re.escape(ref)}\]',
+                placeholder,
+                placeholder_expr
+            )
 
-        # Allow COALESCE wrappers
-        rep = re.sub(r"COALESCE\s*\(\s*\((SELECT .*?)\)\s*,\s*0\s*\)",
-                     r"COALESCE(\1, 0)", rep, flags=re.IGNORECASE | re.DOTALL)
-
-        # Verify remaining tokens are safe arithmetic
-        leftover = re.sub(r"\(SELECT .*?\)", "", rep, flags=re.DOTALL)
-        if not self.SAFE_TOKENS_RE.match(leftover):
+        # Validate that the expression only contains arithmetic operators and commas
+        test_expr = re.sub(r"__M\d__", "0", placeholder_expr)
+        test_expr = re.sub(r"COALESCE", "", test_expr, flags=re.IGNORECASE)
+        if not self.SAFE_TOKENS_RE.match(test_expr):
             return None, "manual_required"
 
-        return rep, "success"
+        # Build inline views for each dependency
+        inline_views = []
+        alias_info = []
+        for idx, ref in enumerate(ordered_refs):
+            alias = f"m{idx}"
+            subquery = produced_sql[ref].strip().rstrip(';')
+            inline_views.append(f"({subquery}) {alias}")
+            alias_info.append((f"__M{idx}__", alias))
+
+        # Replace placeholders with alias references
+        sql_expr = placeholder_expr
+        for placeholder, alias in alias_info:
+            sql_expr = sql_expr.replace(placeholder, f"{alias}.val")
+
+        from_clause = ",\n     ".join(inline_views)
+        final_sql = f"SELECT {sql_expr} AS val\nFROM {from_clause}"
+
+        return final_sql, "success"
 
     def _parse_filter_arg(self, arg: str) -> Optional[List]:
         """Parse filter argument into conditions"""
